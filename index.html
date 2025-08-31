@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KENO – Kombinationen suchen (mit Zahlenbereich)</title>
+<style>
+  body{margin:0;padding:16px;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;background:#0b1220;color:#e5e7eb}
+  .box{max-width:900px;margin:0 auto;background:#111827;border:1px solid #223046;border-radius:10px;padding:14px}
+  h1{margin:0 0 10px}
+  label{display:block;margin:8px 0 4px;color:#a1a1aa}
+  input[type="file"],input[type="number"]{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #263041;background:#0b1220;color:#e5e7eb}
+  a{color:#93c5fd;text-decoration:none}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row>div{flex:1 1 180px}
+  button{padding:10px 14px;border-radius:8px;border:0;cursor:pointer;font-weight:700}
+  .primary{background:linear-gradient(135deg,#059669,#22c55e);color:#04110a}
+  .secondary{background:#1f2937;color:#e5e7eb;border:1px solid #263041}
+  .status{margin-top:8px;font-family:ui-monospace,Consolas,Menlo,monospace;background:#0b1220;border:1px solid #263041;border-radius:8px;padding:8px;white-space:pre-wrap}
+  .results{margin-top:10px;font-family:ui-monospace,Consolas,Menlo,monospace;white-space:pre}
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>KENO – Kombinationen suchen</h1>
+
+    <p>Optionales Archiv zum Vergleichen: <a href="https://www.lottozahlenonline.com/keno/archiv" target="_blank" rel="noopener">lottozahlenonline.com/keno/archiv</a></p>
+
+    <label>Archiv-CSV hochladen (eine Spalte mit Zahlen wie „1-4-9-…“)</label>
+    <input type="file" id="file" accept=".csv,text/csv">
+
+    <div class="row" style="margin-top:10px">
+      <div>
+        <label>Kombi-Größe S</label>
+        <input type="number" id="size" value="10" min="1" max="20">
+      </div>
+      <div>
+        <label>Max. erlaubte Überschneidung (0–S)</label>
+        <input type="number" id="maxOv" value="7" min="0" max="20">
+      </div>
+      <div>
+        <label>Wieviele Ergebnisse</label>
+        <input type="number" id="want" value="30" min="1" max="1000">
+      </div>
+      <div>
+        <label>Max. Versuche</label>
+        <input type="number" id="tries" value="60000" min="1000" step="1000">
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Zahlenbereich – Von</label>
+        <input type="number" id="rangeFrom" value="1" min="1" max="200">
+      </div>
+      <div>
+        <label>Zahlenbereich – Bis</label>
+        <input type="number" id="rangeTo" value="70" min="1" max="200">
+      </div>
+      <div>
+        <label>Seed (optional, für reproduzierbare Ergebnisse)</label>
+        <input type="number" id="seed" value="1" min="0">
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px">
+      <button id="go" class="primary">Generieren</button>
+      <button id="save" class="secondary">Als CSV speichern</button>
+    </div>
+
+    <div id="status" class="status">Bereit.</div>
+    <div id="results" class="results"></div>
+  </div>
+
+<script>
+(function(){
+  const $ = s => document.querySelector(s);
+  let g_rows = []; // CSV als 2D-Array
+
+  // ---------- CSV Basics ----------
+  function autoDelim(text){
+    const cand=[",",";","|","\t"];
+    const first=(text.split(/\r?\n/).find(Boolean)||"");
+    let best=",",score=-1;
+    for(const d of cand){ const s=first.split(d).length; if(s>score){score=s;best=d;} }
+    return best;
+  }
+  function parseCSV(text,d){ return text.split(/\r?\n/).filter(Boolean).map(r=>r.split(d)); }
+
+  // Zahlenspalte: viele Zellen mit „1-2-…“
+  function detectNumbersColumn(rows){
+    const maxCols=Math.max(...rows.map(r=>r.length));
+    let best=-1,score=-1;
+    for(let c=0;c<maxCols;c++){
+      let sc=0;
+      for(const r of rows){
+        if(c>=r.length) continue;
+        const cell=(r[c]||"").trim();
+        if(!cell) continue;
+        const parts=cell.split("-").map(s=>s.trim());
+        if(parts.length>=5 && parts.every(p=>/^\d+$/.test(p))) sc+=parts.length;
+      }
+      if(sc>score){score=sc;best=c;}
+    }
+    return best;
+  }
+
+  // ---------- Bitset & Suche ----------
+  const toBits = arr => arr.reduce((b,v)=> b | (1n<<BigInt(v-1)), 0n);
+  function overlapUpTo(candBits, drawBits, stopAt){
+    let x=candBits&drawBits,c=0; while(x){ x&=(x-1n); c++; if(c>stopAt) break; } return c;
+  }
+  function isValid(cand,drawsBits,maxOv){
+    const cb=toBits(cand);
+    for(const db of drawsBits){ if(overlapUpTo(cb,db,maxOv)>maxOv) return false; }
+    return true;
+  }
+  function rng(seed){ let t=seed>>>0; return ()=>{ t+=0x6D2B79F5; let r=Math.imul(t^(t>>>15),1|t); r^=r+Math.imul(r^(r>>>7),61|r); return ((r^(r>>>14))>>>0)/4294967296; }; }
+
+  // Sample K verschiedene Zahlen aus [A..B]
+  function sampleRange(A,B,S,rand){
+    const n = B-A+1;
+    if (S>n) return null;
+    const a=Array.from({length:n},(_,i)=>A+i);
+    for(let i=0;i<S;i++){ const j=i+Math.floor(rand()*(n-i)); [a[i],a[j]]=[a[j],a[i]]; }
+    return a.slice(0,S).sort((x,y)=>x-y);
+  }
+
+  // ---------- Datei laden ----------
+  $("#file").addEventListener("change", async ()=>{
+    const f=$("#file").files[0]; if(!f){ return; }
+    $("#status").textContent="Lese Datei…";
+    try{
+      const text=await new Promise((res,rej)=>{ const fr=new FileReader(); fr.onload=()=>res(String(fr.result)); fr.onerror=()=>rej(fr.error); fr.readAsText(f); });
+      const rows=parseCSV(text, autoDelim(text));
+      g_rows = rows;
+      $("#status").textContent="Archiv geladen. (Jetzt „Generieren“ drücken)";
+    }catch(e){
+      $("#status").textContent="Fehler beim Lesen: "+e.message;
+    }
+  });
+
+  // ---------- Generieren ----------
+  $("#go").addEventListener("click", async ()=>{
+    try{
+      if (!g_rows.length) { alert("Bitte zuerst CSV laden."); return; }
+      const ncol = detectNumbersColumn(g_rows);
+      if (ncol<0) throw new Error("Zahlenspalte nicht erkannt. Erwartet Format wie 1-4-9-…");
+
+      // Ziehungen extrahieren und auf häufigste Länge normalisieren (typisch 20)
+      const lists=[];
+      for(const r of g_rows){
+        if(ncol>=r.length) continue;
+        const cell=(r[ncol]||"").trim(); if(!cell) continue;
+        const parts=cell.split("-").map(s=>s.trim()).filter(Boolean);
+        if(!parts.every(p=>/^\d+$/.test(p))) continue;
+        lists.push(parts.map(Number));
+      }
+      const freq=new Map(); for(const a of lists) freq.set(a.length,(freq.get(a.length)||0)+1);
+      const drawSize=[...freq.entries()].sort((a,b)=>b[1]-a[1])[0][0];
+      const draws=lists.filter(a=>a.length===drawSize).map(a=>Array.from(new Set(a)).sort((x,y)=>x-y));
+
+      // Einstellungen
+      const S=+$("#size").value;
+      const maxOv=+$("#maxOv").value;
+      const want=+$("#want").value;
+      const tries=+$("#tries").value;
+      const seed=+$("#seed").value>>>0;
+      const A=+$("#rangeFrom").value;
+      const B=+$("#rangeTo").value;
+
+      if (A>B) { alert("Bereich: Von darf nicht größer als Bis sein."); return; }
+      if (S>(B-A+1)) { alert("S ist größer als der ausgewählte Zahlenbereich."); return; }
+
+      // Nur die Anteile der Ziehungen berücksichtigen, die im Bereich liegen (macht die Prüfung strenger & relevanter)
+      const drawsClipped = draws.map(arr => arr.filter(v => v>=A && v<=B));
+      const drawsBits = drawsClipped.map(toBits);
+
+      const rand=rng(seed), seen=new Set(), out=[];
+      $("#status").textContent="Suche läuft…";
+      for(let t=0;t<tries && out.length<want;t++){
+        const cand = sampleRange(A,B,S,rand);
+        if (!cand) break;
+        const key=cand.join("-");
+        if(seen.has(key)) continue; seen.add(key);
+        if(isValid(cand,drawsBits,maxOv)) out.push(cand);
+        if(t%1000===0) $("#status").textContent = `Getestet ${t}/${tries} · Gefunden ${out.length}/${want}`;
+      }
+      $("#results").textContent = out.map((r,i)=>`Kombi ${i+1} → ${r.join(" ")}`).join("\n");
+      $("#status").textContent += `\nFertig. Gefunden: ${out.length}/${want} (S=${S}, Bereich ${A}–${B}, max. Überschneidung ≤ ${maxOv})`;
+    }catch(e){
+      $("#status").textContent="Fehler: "+e.message;
+      alert(e.message);
+    }
+  });
+
+  // ---------- Download ----------
+  $("#save").addEventListener("click", ()=>{
+    const text = $("#results").textContent || "";
+    if (!text.trim()) { alert("Keine Ergebnisse."); return; }
+    const csv = "nr," + Array.from({length:(text.match(/→.*$/m)||[""])[0].trim().split(/\s+/).length-1},(_,i)=>"feld"+(i+1)).join(",") + "\n"
+              + text.split("\n").filter(Boolean).map(line=>{
+                  const m=line.match(/^Kombi\s+(\d+)\s+→\s+(.*)$/);
+                  if(!m) return "";
+                  return `${m[1]},${m[2].trim().replace(/\s+/g,",")}`;
+                }).filter(Boolean).join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a"); a.href=url; a.download="kombinationen.csv"; a.click();
+    setTimeout(()=>URL.revokeObjectURL(url),500);
+  });
+})();
+</script>
+</body>
+</html>
