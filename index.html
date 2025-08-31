@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>KENO – Kombinationen suchen (mit Zahlenbereich)</title>
+<title>KENO – Kombinationen suchen (Bereich + Archiv speichern)</title>
 <style>
   body{margin:0;padding:16px;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;background:#0b1220;color:#e5e7eb}
   .box{max-width:900px;margin:0 auto;background:#111827;border:1px solid #223046;border-radius:10px;padding:14px}
@@ -16,8 +16,10 @@
   button{padding:10px 14px;border-radius:8px;border:0;cursor:pointer;font-weight:700}
   .primary{background:linear-gradient(135deg,#059669,#22c55e);color:#04110a}
   .secondary{background:#1f2937;color:#e5e7eb;border:1px solid #263041}
+  .danger{background:#7f1d1d;color:#fee2e2;border:1px solid #991b1b}
   .status{margin-top:8px;font-family:ui-monospace,Consolas,Menlo,monospace;background:#0b1220;border:1px solid #263041;border-radius:8px;padding:8px;white-space:pre-wrap}
   .results{margin-top:10px;font-family:ui-monospace,Consolas,Menlo,monospace;white-space:pre}
+  .hint{color:#9ca3af;font-size:14px;margin-top:4px}
 </style>
 </head>
 <body>
@@ -28,6 +30,7 @@
 
     <label>Archiv-CSV hochladen (eine Spalte mit Zahlen wie „1-4-9-…“)</label>
     <input type="file" id="file" accept=".csv,text/csv">
+    <div class="hint">Dein Archiv wird lokal im Browser gespeichert (kein Upload ins Internet).</div>
 
     <div class="row" style="margin-top:10px">
       <div>
@@ -40,7 +43,7 @@
       </div>
       <div>
         <label>Wieviele Ergebnisse</label>
-        <input type="number" id="want" value="30" min="1" max="1000">
+        <input type="number" id="want" value="10" min="1" max="1000">
       </div>
       <div>
         <label>Max. Versuche</label>
@@ -58,7 +61,7 @@
         <input type="number" id="rangeTo" value="70" min="1" max="200">
       </div>
       <div>
-        <label>Seed (optional, für reproduzierbare Ergebnisse)</label>
+        <label>Seed (optional, reproduzierbar)</label>
         <input type="number" id="seed" value="1" min="0">
       </div>
     </div>
@@ -66,16 +69,20 @@
     <div class="row" style="margin-top:10px">
       <button id="go" class="primary">Generieren</button>
       <button id="save" class="secondary">Als CSV speichern</button>
+      <button id="clearCache" class="danger">Archiv aus Browser löschen</button>
     </div>
 
-    <div id="status" class="status">Bereit.</div>
+    <div id="status" class="status">Bereit. (Kein Archiv geladen)</div>
     <div id="results" class="results"></div>
   </div>
 
 <script>
 (function(){
   const $ = s => document.querySelector(s);
-  let g_rows = []; // CSV als 2D-Array
+  const CACHE_KEY = "keno_archive_draws_v1"; // localStorage-Key
+
+  let g_draws = [];     // Array<Array<number>> (nur häufigste Ziehungsgröße)
+  let g_drawSize = 0;   // z. B. 20
 
   // ---------- CSV Basics ----------
   function autoDelim(text){
@@ -126,6 +133,34 @@
     return a.slice(0,S).sort((x,y)=>x-y);
   }
 
+  // ---------- Cache ----------
+  function saveArchiveToCache(draws, drawSize){
+    try{
+      const payload = { drawSize, draws, savedAt: Date.now() };
+      localStorage.setItem(CACHE_KEY, JSON.stringify(payload));
+      return true;
+    }catch(e){
+      console.warn("Cache speichern fehlgeschlagen:", e);
+      return false;
+    }
+  }
+  function loadArchiveFromCache(){
+    try{
+      const raw = localStorage.getItem(CACHE_KEY);
+      if(!raw) return null;
+      const obj = JSON.parse(raw);
+      if(!obj || !Array.isArray(obj.draws) || !obj.drawSize) return null;
+      return obj;
+    }catch(e){
+      return null;
+    }
+  }
+  function clearCache(){
+    localStorage.removeItem(CACHE_KEY);
+    g_draws = []; g_drawSize = 0;
+    $("#status").textContent = "Archiv im Browser gelöscht. Bitte CSV neu laden.";
+  }
+
   // ---------- Datei laden ----------
   $("#file").addEventListener("change", async ()=>{
     const f=$("#file").files[0]; if(!f){ return; }
@@ -133,23 +168,12 @@
     try{
       const text=await new Promise((res,rej)=>{ const fr=new FileReader(); fr.onload=()=>res(String(fr.result)); fr.onerror=()=>rej(fr.error); fr.readAsText(f); });
       const rows=parseCSV(text, autoDelim(text));
-      g_rows = rows;
-      $("#status").textContent="Archiv geladen. (Jetzt „Generieren“ drücken)";
-    }catch(e){
-      $("#status").textContent="Fehler beim Lesen: "+e.message;
-    }
-  });
-
-  // ---------- Generieren ----------
-  $("#go").addEventListener("click", async ()=>{
-    try{
-      if (!g_rows.length) { alert("Bitte zuerst CSV laden."); return; }
-      const ncol = detectNumbersColumn(g_rows);
+      const ncol = detectNumbersColumn(rows);
       if (ncol<0) throw new Error("Zahlenspalte nicht erkannt. Erwartet Format wie 1-4-9-…");
 
       // Ziehungen extrahieren und auf häufigste Länge normalisieren (typisch 20)
       const lists=[];
-      for(const r of g_rows){
+      for(const r of rows){
         if(ncol>=r.length) continue;
         const cell=(r[ncol]||"").trim(); if(!cell) continue;
         const parts=cell.split("-").map(s=>s.trim()).filter(Boolean);
@@ -157,8 +181,32 @@
         lists.push(parts.map(Number));
       }
       const freq=new Map(); for(const a of lists) freq.set(a.length,(freq.get(a.length)||0)+1);
-      const drawSize=[...freq.entries()].sort((a,b)=>b[1]-a[1])[0][0];
-      const draws=lists.filter(a=>a.length===drawSize).map(a=>Array.from(new Set(a)).sort((x,y)=>x-y));
+      g_drawSize=[...freq.entries()].sort((a,b)=>b[1]-a[1])[0][0];
+      g_draws=lists.filter(a=>a.length===g_drawSize).map(a=>Array.from(new Set(a)).sort((x,y)=>x-y));
+
+      const ok = saveArchiveToCache(g_draws, g_drawSize);
+      $("#status").textContent=`Archiv geladen: ${g_draws.length} Ziehungen (Ziehungsgröße ${g_drawSize})` + (ok ? " · im Browser gespeichert ✅" : " · (Konnte nicht speichern ⚠️)");
+    }catch(e){
+      $("#status").textContent="Fehler beim Lesen: "+e.message;
+    }
+  });
+
+  // Beim Start: aus Cache laden, wenn vorhanden
+  (function initFromCache(){
+    const cached = loadArchiveFromCache();
+    if(cached){
+      g_draws = cached.draws;
+      g_drawSize = cached.drawSize;
+      const saved = new Date(cached.savedAt);
+      $("#status").textContent = `Archiv aus Browser geladen: ${g_draws.length} Ziehungen (Ziehungsgröße ${g_drawSize}) · gespeichert am ${saved.toLocaleDateString()} ${saved.toLocaleTimeString()}`;
+    }
+  })();
+  $("#clearCache").addEventListener("click", clearCache);
+
+  // ---------- Generieren ----------
+  $("#go").addEventListener("click", async ()=>{
+    try{
+      if (!g_draws.length) { alert("Bitte zuerst CSV laden (oder Cache aktivieren)."); return; }
 
       // Einstellungen
       const S=+$("#size").value;
@@ -168,16 +216,15 @@
       const seed=+$("#seed").value>>>0;
       const A=+$("#rangeFrom").value;
       const B=+$("#rangeTo").value;
-
       if (A>B) { alert("Bereich: Von darf nicht größer als Bis sein."); return; }
       if (S>(B-A+1)) { alert("S ist größer als der ausgewählte Zahlenbereich."); return; }
 
-      // Nur die Anteile der Ziehungen berücksichtigen, die im Bereich liegen (macht die Prüfung strenger & relevanter)
-      const drawsClipped = draws.map(arr => arr.filter(v => v>=A && v<=B));
+      // Nur den Anteil der Ziehungen im Bereich verwenden
+      const drawsClipped = g_draws.map(arr => arr.filter(v => v>=A && v<=B));
       const drawsBits = drawsClipped.map(toBits);
 
       const rand=rng(seed), seen=new Set(), out=[];
-      $("#status").textContent="Suche läuft…";
+      $("#status").textContent=`Suche gestartet… (S=${S}, Bereich ${A}–${B}, max. Überschneidung ≤ ${maxOv})`;
       for(let t=0;t<tries && out.length<want;t++){
         const cand = sampleRange(A,B,S,rand);
         if (!cand) break;
@@ -187,7 +234,7 @@
         if(t%1000===0) $("#status").textContent = `Getestet ${t}/${tries} · Gefunden ${out.length}/${want}`;
       }
       $("#results").textContent = out.map((r,i)=>`Kombi ${i+1} → ${r.join(" ")}`).join("\n");
-      $("#status").textContent += `\nFertig. Gefunden: ${out.length}/${want} (S=${S}, Bereich ${A}–${B}, max. Überschneidung ≤ ${maxOv})`;
+      $("#status").textContent = `Fertig. Gefunden: ${out.length}/${want} (S=${S}, Bereich ${A}–${B}, max. Überschneidung ≤ ${maxOv})\nArchiv: ${g_draws.length} Ziehungen (Ziehungsgröße ${g_drawSize})`;
     }catch(e){
       $("#status").textContent="Fehler: "+e.message;
       alert(e.message);
@@ -198,12 +245,14 @@
   $("#save").addEventListener("click", ()=>{
     const text = $("#results").textContent || "";
     if (!text.trim()) { alert("Keine Ergebnisse."); return; }
-    const csv = "nr," + Array.from({length:(text.match(/→.*$/m)||[""])[0].trim().split(/\s+/).length-1},(_,i)=>"feld"+(i+1)).join(",") + "\n"
-              + text.split("\n").filter(Boolean).map(line=>{
-                  const m=line.match(/^Kombi\s+(\d+)\s+→\s+(.*)$/);
-                  if(!m) return "";
-                  return `${m[1]},${m[2].trim().replace(/\s+/g,",")}`;
-                }).filter(Boolean).join("\n");
+    const lines = text.split("\n").filter(Boolean)
+      .map(line=>{
+        const m=line.match(/^Kombi\s+(\d+)\s+→\s+(.*)$/);
+        if(!m) return null;
+        return `${m[1]},${m[2].trim().replace(/\s+/g,",")}`;
+      }).filter(Boolean);
+    const header = "nr," + (lines[0] ? lines[0].split(",").length-1 : 0);
+    const csv = "nr," + Array.from({length: (lines[0] ? lines[0].split(",").length-1 : 0)},(_,i)=>"feld"+(i+1)).join(",") + "\n" + lines.join("\n");
     const blob=new Blob([csv],{type:"text/csv;charset=utf-8"});
     const url=URL.createObjectURL(blob);
     const a=document.createElement("a"); a.href=url; a.download="kombinationen.csv"; a.click();
